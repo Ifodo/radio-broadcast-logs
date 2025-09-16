@@ -270,13 +270,23 @@ def get_now_on_air():
     """Return the most recent on-air event based on latest ingested log."""
     db = SessionLocal()
     try:
-        # Prefer ordering by air_timestamp (most accurate), fallback to id
+        # Prefer a LIVE candidate: recently produced (producer_timestamp within last 5 minutes)
+        live_window_start = datetime.utcnow() - timedelta(minutes=5)
         log: Optional[Log] = (
             db.query(Log)
-            .filter(Log.air_timestamp.isnot(None))
-            .order_by(Log.air_timestamp.desc())
+            .filter(Log.producer_timestamp.isnot(None))
+            .filter(Log.producer_timestamp >= live_window_start)
+            .order_by(Log.air_timestamp.desc().nullslast(), Log.id.desc())
             .first()
         )
+        if not log:
+            # Fallback: latest by air time overall
+            log = (
+                db.query(Log)
+                .filter(Log.air_timestamp.isnot(None))
+                .order_by(Log.air_timestamp.desc())
+                .first()
+            )
         if not log:
             log = db.query(Log).order_by(Log.id.desc()).first()
         if not log:
