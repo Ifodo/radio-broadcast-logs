@@ -412,3 +412,105 @@ def stats_spot_titles(
     finally:
         db.close()
 
+
+@app.get("/stats/spots/all")
+def stats_spots_all(
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    limit: int = Query(50, ge=1, le=500, description="Number of titles per page"),
+):
+    """Aggregate all SPOT titles across the database with pagination.
+    Groups by normalized title and returns per-filename breakdown for each title.
+    """
+    db = SessionLocal()
+    try:
+        offset = (page - 1) * limit
+
+        total_sql = sql_text(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT 1
+                FROM logs
+                WHERE event_type ILIKE 'SPOT' AND title IS NOT NULL
+                GROUP BY lower(trim(title))
+            ) t
+            """
+        )
+        total_titles = db.execute(total_sql).scalar() or 0
+
+        main_sql = sql_text(
+            """
+            WITH base AS (
+                SELECT lower(trim(title)) AS group_title,
+                       COALESCE(air_timestamp, timestamp) AS ts
+                FROM logs
+                WHERE event_type ILIKE 'SPOT' AND title IS NOT NULL
+            ),
+            title_agg AS (
+                SELECT group_title,
+                       COUNT(*) AS total_count,
+                       MIN(ts) AS first_ts,
+                       MAX(ts) AS last_ts
+                FROM base
+                GROUP BY group_title
+            ),
+            paged AS (
+                SELECT * FROM title_agg
+                ORDER BY total_count DESC, last_ts DESC
+                LIMIT :limit OFFSET :offset
+            )
+            SELECT group_title, total_count, first_ts, last_ts
+            FROM paged
+            """
+        )
+        rows = db.execute(main_sql, {"limit": limit, "offset": offset}).fetchall()
+
+        items = []
+        for r in rows:
+            group_title = r[0]
+            total_count = int(r[1])
+            first_ts = r[2]
+            last_ts = r[3]
+
+            files_sql = sql_text(
+                """
+                SELECT filename,
+                       COUNT(*) AS count,
+                       MIN(COALESCE(air_timestamp, timestamp)) AS first_ts,
+                       MAX(COALESCE(air_timestamp, timestamp)) AS last_ts
+                FROM logs
+                WHERE event_type ILIKE 'SPOT'
+                  AND title IS NOT NULL
+                  AND lower(trim(title)) = :group_title
+                GROUP BY filename
+                ORDER BY last_ts DESC
+                """
+            )
+            file_rows = db.execute(files_sql, {"group_title": group_title}).fetchall()
+            files = [
+                {
+                    "filename": fr[0],
+                    "count": int(fr[1]),
+                    "first_air_timestamp": (fr[2].isoformat() if fr[2] else None),
+                    "last_air_timestamp": (fr[3].isoformat() if fr[3] else None),
+                }
+                for fr in file_rows
+            ]
+
+            items.append(
+                {
+                    "title": group_title,
+                    "total_count": total_count,
+                    "first_air_timestamp": first_ts.isoformat() if first_ts else None,
+                    "last_air_timestamp": last_ts.isoformat() if last_ts else None,
+                    "files": files,
+                }
+            )
+
+        has_next = (offset + len(items)) < total_titles
+        return {
+            "items": items,
+            "page": {"page": page, "limit": limit, "total_titles": total_titles, "hasNext": has_next},
+        }
+    finally:
+        db.close()
+
