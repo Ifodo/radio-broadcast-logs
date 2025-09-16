@@ -319,3 +319,124 @@ def get_events_by_type(
     finally:
         db.close()
 
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+@app.get("/stats/spots/titles")
+def stats_spot_titles(
+    from_: Optional[str] = Query(None, alias="from", description="ISO start datetime (uses air_timestamp)"),
+    to: Optional[str] = Query(None, description="ISO end datetime (uses air_timestamp)"),
+    q: Optional[str] = Query(None, description="Filter titles by case-insensitive substring"),
+    limit: int = Query(50, ge=1, le=500),
+    orderBy: str = Query("count", pattern="^(?i)(count|last_seen)$"),
+    order: str = Query("desc", pattern="^(?i)(asc|desc)$"),
+    includeTimes: bool = Query(False),
+    timesLimit: int = Query(10, ge=1, le=100),
+    normalize: bool = Query(True, description="Normalize titles by lower/trim for grouping"),
+):
+    db = SessionLocal()
+    try:
+        dt_from = _parse_iso_datetime(from_)
+        dt_to = _parse_iso_datetime(to)
+
+        params = {
+            "normalize": normalize,
+            "from": dt_from,
+            "to": dt_to,
+            "q": (q.lower().strip() if q and normalize else (q.strip() if q else None)),
+            "limit": limit,
+            "orderBy": orderBy.lower(),
+            "order": order.lower(),
+        }
+
+        # Build main aggregation query
+        sql = sql_text(
+            """
+            WITH base AS (
+                SELECT
+                    CASE WHEN :normalize THEN lower(trim(title)) ELSE title END AS group_title,
+                    title AS original_title,
+                    COALESCE(air_timestamp, timestamp) AS sort_ts
+                FROM logs
+                WHERE event_type ILIKE 'SPOT'
+                  AND title IS NOT NULL
+                  AND (:from IS NULL OR COALESCE(air_timestamp, timestamp) >= :from)
+                  AND (:to IS NULL OR COALESCE(air_timestamp, timestamp) <= :to)
+                  AND (
+                    :q IS NULL OR (
+                      CASE WHEN :normalize THEN lower(trim(title)) ELSE title END
+                    ) ILIKE '%' || :q || '%'
+                  )
+            )
+            SELECT group_title AS title,
+                   COUNT(*) AS count,
+                   MIN(sort_ts) AS first_air_timestamp,
+                   MAX(sort_ts) AS last_air_timestamp
+            FROM base
+            GROUP BY group_title
+            ORDER BY
+                CASE WHEN :orderBy = 'count' AND :order = 'asc' THEN COUNT(*) END ASC NULLS LAST,
+                CASE WHEN :orderBy = 'count' AND :order = 'desc' THEN COUNT(*) END DESC NULLS LAST,
+                CASE WHEN :orderBy = 'last_seen' AND :order = 'asc' THEN MAX(sort_ts) END ASC NULLS LAST,
+                CASE WHEN :orderBy = 'last_seen' AND :order = 'desc' THEN MAX(sort_ts) END DESC NULLS LAST
+            LIMIT :limit
+            """
+        )
+
+        rows = db.execute(sql, params).fetchall()
+
+        results = []
+        for r in rows:
+            title_group = r[0]
+            count = int(r[1])
+            first_ts = r[2]
+            last_ts = r[3]
+
+            item = {
+                "title": title_group,
+                "count": count,
+                "first_air_timestamp": first_ts.isoformat() if first_ts else None,
+                "last_air_timestamp": last_ts.isoformat() if last_ts else None,
+            }
+
+            if includeTimes:
+                times_sql = sql_text(
+                    """
+                    SELECT COALESCE(air_timestamp, timestamp) AS ts
+                    FROM logs
+                    WHERE event_type ILIKE 'SPOT'
+                      AND title IS NOT NULL
+                      AND (
+                        CASE WHEN :normalize THEN lower(trim(title)) ELSE title END
+                      ) = :group_title
+                      AND (:from IS NULL OR COALESCE(air_timestamp, timestamp) >= :from)
+                      AND (:to IS NULL OR COALESCE(air_timestamp, timestamp) <= :to)
+                    ORDER BY ts DESC
+                    LIMIT :timesLimit
+                    """
+                )
+                times_rows = db.execute(
+                    times_sql,
+                    {
+                        "normalize": normalize,
+                        "group_title": title_group,
+                        "from": dt_from,
+                        "to": dt_to,
+                        "timesLimit": timesLimit,
+                    },
+                ).fetchall()
+                item["air_times"] = [tr[0].isoformat() for tr in times_rows if tr[0] is not None]
+
+            results.append(item)
+
+        return {"items": results, "count": len(results)}
+    finally:
+        db.close()
+
