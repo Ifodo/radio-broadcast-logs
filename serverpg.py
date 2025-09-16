@@ -1,10 +1,12 @@
 import os
+import hashlib
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.sql import text as sql_text
 from dotenv import load_dotenv
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from typing import Any, List, Optional
 
 # Load environment variables
@@ -41,12 +43,17 @@ class Log(Base):
     title = Column(String(255), nullable=True)
     raw_line = Column(Text)
     timestamp = Column(DateTime, default=datetime.utcnow)
+    # New fields for idempotency and accurate ordering
+    event_id = Column(String(128), nullable=True, index=True)
+    air_timestamp = Column(DateTime, nullable=True, index=True)
+    producer_timestamp = Column(DateTime, nullable=True)
 
 # Create tables if they don’t exist
 Base.metadata.create_all(bind=engine)
 
 # FastAPI app
 app = FastAPI(title="Jazler Monitoring API")
+app.state.syncing_until = datetime.utcnow() - timedelta(seconds=1)
 
 # Pydantic model for request
 class LogEntry(BaseModel):
@@ -56,6 +63,9 @@ class LogEntry(BaseModel):
     artist: str | None = None
     title: str | None = None
     raw_line: str
+    local_timestamp: Optional[str] = None
+    event_id: Optional[str] = None
+    is_backfill: Optional[bool] = None
 
 
 # ---------- Utilities ----------
@@ -80,10 +90,65 @@ def _compute_latency_seconds(air_ts: Optional[datetime], local_ts: Optional[date
     except Exception:
         return None
 
+
+def _ensure_columns_exist():
+    """Attempt to add new columns if they don't exist (PostgreSQL)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(sql_text("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='logs' AND column_name='event_id'
+                    ) THEN
+                        ALTER TABLE logs ADD COLUMN event_id varchar(128);
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='logs' AND column_name='air_timestamp'
+                    ) THEN
+                        ALTER TABLE logs ADD COLUMN air_timestamp timestamp NULL;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='logs' AND column_name='producer_timestamp'
+                    ) THEN
+                        ALTER TABLE logs ADD COLUMN producer_timestamp timestamp NULL;
+                    END IF;
+                END$$;
+            """))
+    except Exception as e:
+        # Non-fatal; table might already be correct or running on an engine without permissions
+        print(f"[migrate] Skipped/failed ensuring new columns: {e}")
+
+
+_ensure_columns_exist()
+
+def _compute_event_id(entry: LogEntry) -> str:
+    base = f"{entry.filename}|{entry.play_time}|{entry.event_type}|{entry.artist or ''}|{entry.title or ''}|{entry.raw_line}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
 @app.post("/ingest")
 def ingest_log(entry: LogEntry):
     db = SessionLocal()
     try:
+        # compute helper fields
+        event_id = entry.event_id or _compute_event_id(entry)
+        air_ts = _parse_air_timestamp(entry.filename, entry.play_time)
+        producer_ts = None
+        if entry.local_timestamp:
+            try:
+                producer_ts = datetime.fromisoformat(entry.local_timestamp)
+            except Exception:
+                producer_ts = None
+
+        # idempotency check
+        existing = db.query(Log).filter(Log.event_id == event_id).first()
+        if existing:
+            return {"status": "success", "id": existing.id, "duplicated": True}
+
         log = Log(
             filename=entry.filename,
             play_time=entry.play_time,
@@ -91,11 +156,71 @@ def ingest_log(entry: LogEntry):
             artist=entry.artist,
             title=entry.title,
             raw_line=entry.raw_line,
+            event_id=event_id,
+            air_timestamp=air_ts,
+            producer_timestamp=producer_ts,
         )
         db.add(log)
         db.commit()
         db.refresh(log)
-        return {"status": "success", "id": log.id}
+        # mark syncing window if backfill
+        if entry.is_backfill:
+            app.state.syncing_until = datetime.utcnow() + timedelta(seconds=20)
+        return {"status": "success", "id": log.id, "duplicated": False}
+    except Exception as e:
+        db.rollback()
+        return {"status": "error", "detail": str(e)}
+    finally:
+        db.close()
+
+
+class IngestBulkRequest(BaseModel):
+    items: List[LogEntry]
+    is_backfill: Optional[bool] = None
+
+
+@app.post("/ingest/bulk")
+def ingest_bulk(req: IngestBulkRequest):
+    db = SessionLocal()
+    inserted = 0
+    duplicates = 0
+    try:
+        for item in req.items:
+            try:
+                event_id = item.event_id or _compute_event_id(item)
+                exists = db.query(Log).filter(Log.event_id == event_id).first()
+                if exists:
+                    duplicates += 1
+                    continue
+                air_ts = _parse_air_timestamp(item.filename, item.play_time)
+                producer_ts = None
+                if item.local_timestamp:
+                    try:
+                        producer_ts = datetime.fromisoformat(item.local_timestamp)
+                    except Exception:
+                        producer_ts = None
+                row = Log(
+                    filename=item.filename,
+                    play_time=item.play_time,
+                    event_type=item.event_type,
+                    artist=item.artist,
+                    title=item.title,
+                    raw_line=item.raw_line,
+                    event_id=event_id,
+                    air_timestamp=air_ts,
+                    producer_timestamp=producer_ts,
+                )
+                db.add(row)
+                inserted += 1
+            except Exception:
+                db.rollback()
+                db.begin()
+                continue
+        db.commit()
+        # update syncing indicator
+        if req.is_backfill or any(getattr(i, "is_backfill", False) for i in req.items):
+            app.state.syncing_until = datetime.utcnow() + timedelta(seconds=20)
+        return {"status": "success", "inserted": inserted, "duplicates": duplicates}
     except Exception as e:
         db.rollback()
         return {"status": "error", "detail": str(e)}
@@ -123,8 +248,8 @@ class EventItem(BaseModel):
 
 
 def _serialize_log(log: Log) -> EventItem:
-    air_ts = _parse_air_timestamp(log.filename or "", log.play_time or "") if (log.filename and log.play_time) else None
-    local_ts = log.timestamp
+    air_ts = log.air_timestamp or (_parse_air_timestamp(log.filename or "", log.play_time or "") if (log.filename and log.play_time) else None)
+    local_ts = log.producer_timestamp or log.timestamp
     return EventItem(
         id=log.id,
         station=None,
@@ -145,10 +270,22 @@ def get_now_on_air():
     """Return the most recent on-air event based on latest ingested log."""
     db = SessionLocal()
     try:
-        log: Optional[Log] = db.query(Log).order_by(Log.id.desc()).first()
+        # Prefer ordering by air_timestamp (most accurate), fallback to id
+        log: Optional[Log] = (
+            db.query(Log)
+            .filter(Log.air_timestamp.isnot(None))
+            .order_by(Log.air_timestamp.desc())
+            .first()
+        )
+        if not log:
+            log = db.query(Log).order_by(Log.id.desc()).first()
         if not log:
             raise HTTPException(status_code=404, detail="No events available")
-        return _serialize_log(log)
+        item = _serialize_log(log)
+        syncing = datetime.utcnow() < getattr(app.state, "syncing_until", datetime.utcnow() - timedelta(seconds=1))
+        data = item.dict()
+        data["syncing"] = syncing
+        return data
     finally:
         db.close()
 
@@ -163,9 +300,9 @@ def get_events_by_type(
     try:
         q = db.query(Log).filter(Log.event_type.ilike(type))
         if order.lower() == "asc":
-            q = q.order_by(Log.id.asc())
+            q = q.order_by(Log.air_timestamp.asc().nullslast(), Log.id.asc())
         else:
-            q = q.order_by(Log.id.desc())
+            q = q.order_by(Log.air_timestamp.desc().nullslast(), Log.id.desc())
         logs: List[Log] = q.limit(limit).all()
         items = [_serialize_log(l) for l in logs]
         return {"items": [item.dict() for item in items], "count": len(items)}
