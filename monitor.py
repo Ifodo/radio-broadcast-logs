@@ -54,6 +54,24 @@ def init_db():
     conn.close()
 
 
+def migrate_db():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(logs)")
+        cols = [row[1] for row in cursor.fetchall()]
+        if "event_id" not in cols:
+            cursor.execute("ALTER TABLE logs ADD COLUMN event_id TEXT")
+        if "sent" not in cols:
+            cursor.execute("ALTER TABLE logs ADD COLUMN sent INTEGER DEFAULT 0")
+        if "sent_at" not in cols:
+            cursor.execute("ALTER TABLE logs ADD COLUMN sent_at DATETIME")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        console.log(f"[yellow]DB migration notice: {e}[/yellow]")
+
+
 def _compute_event_id(filename, play_time, event_type, artist, title, raw_line):
     base = f"{filename}|{play_time}|{event_type}|{artist or ''}|{title or ''}|{raw_line or ''}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
@@ -139,6 +157,7 @@ def push_to_remote(filename, play_time, event_type, artist, title, raw_line, eve
 def backfill_unsent(batch_size=100, sleep_seconds=3):
     while True:
         try:
+            migrate_db()
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
             cursor.execute(
@@ -214,6 +233,7 @@ def get_today_logfile():
 
 if __name__ == "__main__":
     init_db()
+    migrate_db()
     console.log("✅ Database initialized")
 
     # start backfill worker thread
