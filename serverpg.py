@@ -1,8 +1,8 @@
 import os
 import hashlib
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.sql import text as sql_text
 from dotenv import load_dotenv
@@ -47,6 +47,16 @@ class Log(Base):
     event_id = Column(String(128), nullable=True, index=True)
     air_timestamp = Column(DateTime, nullable=True, index=True)
     producer_timestamp = Column(DateTime, nullable=True)
+
+# Define AudioFiles table
+class AudioFile(Base):
+    __tablename__ = "audio_files"
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String(255), unique=True, index=True, nullable=False)
+    upload_time = Column(DateTime, default=datetime.utcnow)
+    file_size = Column(Integer, nullable=False)
+    uploader_ip = Column(String(64), nullable=True)
+    __table_args__ = (UniqueConstraint('filename', name='uq_audio_filename'),)
 
 # Create tables if they don’t exist
 Base.metadata.create_all(bind=engine)
@@ -224,6 +234,48 @@ def ingest_bulk(req: IngestBulkRequest):
     except Exception as e:
         db.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        db.close()
+
+@app.post("/audio_logs")
+def upload_audio_log(request: Request, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".mp3"):
+        raise HTTPException(status_code=400, detail="Only .mp3 files are allowed.")
+    db = SessionLocal()
+    try:
+        # Check for duplicate filename in DB
+        existing = db.query(AudioFile).filter(AudioFile.filename == file.filename).first()
+        if existing or os.path.exists(os.path.join("audio_files", file.filename)):
+            raise HTTPException(status_code=409, detail="File with this name already exists.")
+        # Save file to disk
+        dest_path = os.path.join("audio_files", file.filename)
+        with open(dest_path, "wb") as out_file:
+            content = file.file.read()
+            out_file.write(content)
+        file_size = os.path.getsize(dest_path)
+        uploader_ip = request.client.host if request.client else None
+        # Save metadata to DB
+        audio_entry = AudioFile(
+            filename=file.filename,
+            upload_time=datetime.utcnow(),
+            file_size=file_size,
+            uploader_ip=uploader_ip,
+        )
+        db.add(audio_entry)
+        db.commit()
+        db.refresh(audio_entry)
+        return {
+            "status": "success",
+            "filename": audio_entry.filename,
+            "upload_time": audio_entry.upload_time.isoformat(),
+            "file_size": audio_entry.file_size,
+            "uploader_ip": audio_entry.uploader_ip,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
