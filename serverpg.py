@@ -1,13 +1,17 @@
 import os
 import hashlib
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.sql import text as sql_text
 from dotenv import load_dotenv
 from datetime import datetime, date, time, timedelta
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Literal
+from mutagen.mp3 import MP3
+import smtplib
+from email.message import EmailMessage
+import logging
 
 # Load environment variables
 load_dotenv()
@@ -64,6 +68,13 @@ Base.metadata.create_all(bind=engine)
 # FastAPI app
 app = FastAPI(title="Jazler Monitoring API")
 app.state.syncing_until = datetime.utcnow() - timedelta(seconds=1)
+
+# SMTP configuration (set these as environment variables or hardcode for testing)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.example.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "user@example.com")
+SMTP_PASS = os.getenv("SMTP_PASS", "password")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
 # Pydantic model for request
 class LogEntry(BaseModel):
@@ -565,4 +576,287 @@ def stats_spots_all(
         }
     finally:
         db.close()
+
+
+        # -------------------- file analysis --------------------
+
+from sqlalchemy import JSON  # add JSON type for analysis result storage
+
+# ---------- New Model for Analysis Jobs ----------
+class AnalysisJob(Base):
+    __tablename__ = "analysis_jobs"
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String(255), nullable=False, index=True)
+    spot_name = Column(String(255), nullable=False)
+    status = Column(String(50), default="queued", nullable=False)  # queued, processing, completed, failed, cancelled
+    progress = Column(Integer, nullable=True)
+    result = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    match_type = Column(String(32), default="substring")
+    cancelled = Column(Integer, default=0)  # 0 = not cancelled, 1 = cancelled
+
+
+# Create the new table if not exists
+Base.metadata.create_all(bind=engine)
+
+
+# ---------- Helper for Analysis ----------
+def _run_analysis(job_id: int):
+    db = SessionLocal()
+    try:
+        job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+        if not job or job.cancelled:
+            logger.info(f"Job {job_id} cancelled or not found before start.")
+            return
+        try:
+            logger.info(f"Job {job_id} started: {job.filename} / {job.spot_name}")
+            job.status = "processing"
+            job.progress = 10
+            db.commit()
+
+            # Audio content analysis (already present)
+            audio_info = {}
+            audio_file_entry = db.query(AudioFile).filter(AudioFile.filename == job.filename).first()
+            if audio_file_entry:
+                audio_path = os.path.join("audio_files", audio_file_entry.filename)
+                try:
+                    from mutagen.mp3 import MP3
+                    audio = MP3(audio_path)
+                    audio_info = {
+                        "duration_seconds": round(audio.info.length, 2) if hasattr(audio.info, 'length') else None,
+                        "bitrate": audio.info.bitrate if hasattr(audio.info, 'bitrate') else None,
+                        "mode": getattr(audio.info, 'mode', None),
+                        "sample_rate": getattr(audio.info, 'sample_rate', None),
+                        "channels": getattr(audio.info, 'channels', None),
+                    }
+                except Exception as e:
+                    audio_info = {"error": f"Audio analysis failed: {e}"}
+                    logger.error(f"Audio analysis failed for job {job_id}: {e}")
+
+            # Spot name matching
+            match_type = getattr(job, 'match_type', 'substring')
+            spot_name = job.spot_name
+            query = db.query(Log).filter(Log.filename == job.filename).filter(Log.event_type.ilike("SPOT"))
+            if match_type == 'exact':
+                query = query.filter(Log.title == spot_name)
+            elif match_type == 'regex':
+                query = query.filter(Log.title.op('~*')(spot_name))
+            else:
+                query = query.filter(Log.title.ilike(f"%{spot_name}%"))
+            rows = query.order_by(Log.air_timestamp.asc().nullslast()).all()
+
+            # Check for cancellation during processing
+            job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+            if job and job.cancelled:
+                job.status = "cancelled"
+                job.progress = None
+                db.commit()
+                logger.info(f"Job {job_id} cancelled during processing.")
+                return
+
+            results = []
+            for row in rows:
+                results.append({
+                    "id": row.id,
+                    "title": row.title,
+                    "artist": row.artist,
+                    "play_time": row.play_time,
+                    "air_timestamp": row.air_timestamp.isoformat() if row.air_timestamp else None,
+                    "producer_timestamp": row.producer_timestamp.isoformat() if row.producer_timestamp else None,
+                    "source_file": row.filename,
+                })
+
+            job.progress = 90
+            job.result = {
+                "spot_name": job.spot_name,
+                "filename": job.filename,
+                "audio_info": audio_info,
+                "matches": results,
+                "count": len(results),
+                "match_type": match_type,
+            }
+            job.status = "completed"
+            job.progress = 100
+            db.commit()
+            logger.info(f"Job {job_id} completed: {len(results)} matches.")
+        except Exception as e:
+            job.status = "failed"
+            job.result = {"error": str(e)}
+            db.commit()
+            logger.error(f"Job {job_id} failed: {e}")
+    finally:
+        db.close()
+
+
+# ---------- API Endpoints ----------
+class AnalysisRequest(BaseModel):
+    filename: str
+    spot_name: str
+    match_type: Optional[Literal['exact', 'substring', 'regex']] = 'substring'
+
+
+@app.post("/analyze/request")
+def request_analysis(req: AnalysisRequest, background_tasks: BackgroundTasks):
+    db = SessionLocal()
+    try:
+        # Ensure the file exists in audio_files
+        file_entry = db.query(AudioFile).filter(AudioFile.filename == req.filename).first()
+        if not file_entry:
+            logger.warning(f"Analysis request for missing file: {req.filename}")
+            raise HTTPException(status_code=404, detail="Audio file not found")
+
+        job = AnalysisJob(filename=req.filename, spot_name=req.spot_name, status="queued", progress=0)
+        # Store match_type in job if present
+        if hasattr(req, 'match_type') and req.match_type:
+            setattr(job, 'match_type', req.match_type)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        logger.info(f"Job {job.id} created: {req.filename} / {req.spot_name}")
+
+        # Enqueue background analysis
+        background_tasks.add_task(_run_analysis, job.id)
+
+        return {"status": "queued", "job_id": job.id}
+    finally:
+        db.close()
+
+
+@app.get("/analyze/status/{job_id}")
+def get_analysis_status(job_id: int):
+    db = SessionLocal()
+    try:
+        job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "progress": job.progress,
+            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/analyze/report/{job_id}")
+def get_analysis_report(job_id: int):
+    db = SessionLocal()
+    try:
+        job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "completed":
+            return {"status": job.status, "message": "Report not ready"}
+        return {"status": "success", "report": job.result}
+    finally:
+        db.close()
+
+
+class SendReportRequest(BaseModel):
+    email: str
+
+
+@app.post("/analyze/send-report/{job_id}")
+def send_analysis_report(job_id: int, req: SendReportRequest):
+    db = SessionLocal()
+    try:
+        job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "completed":
+            raise HTTPException(status_code=400, detail="Report not ready")
+
+        # Prepare email
+        msg = EmailMessage()
+        msg["Subject"] = f"Analysis Report for {job.spot_name} in {job.filename}"
+        msg["From"] = SMTP_FROM
+        msg["To"] = req.email
+        report = job.result
+        body = f"Spot Name: {report.get('spot_name')}\nFilename: {report.get('filename')}\nCount: {report.get('count')}\nMatch Type: {report.get('match_type')}\n\nAudio Info: {report.get('audio_info')}\n\nMatches:\n"
+        for match in report.get("matches", []):
+            body += f"- {match}\n"
+        msg.set_content(body)
+
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+            return {
+                "status": "success",
+                "message": f"Report for job {job.id} sent to {req.email}",
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to send email: {e}",
+            }
+    finally:
+        db.close()
+
+
+@app.post("/analyze/cancel/{job_id}")
+def cancel_analysis_job(job_id: int):
+    db = SessionLocal()
+    try:
+        job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+        if not job:
+            logger.warning(f"Cancel request for missing job: {job_id}")
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status in ("completed", "failed", "cancelled"):
+            logger.info(f"Cancel request for finished job: {job_id} (status: {job.status})")
+            return {"status": job.status, "message": "Job already finished or cancelled"}
+        job.cancelled = 1
+        job.status = "cancelled"
+        db.commit()
+        logger.info(f"Job {job_id} cancelled by user.")
+        return {"status": "cancelled", "job_id": job.id}
+    finally:
+        db.close()
+
+@app.post("/analyze/retry/{job_id}")
+def retry_analysis_job(job_id: int, background_tasks: BackgroundTasks):
+    db = SessionLocal()
+    try:
+        job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
+        if not job:
+            logger.warning(f"Retry request for missing job: {job_id}")
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status not in ("failed", "cancelled"):
+            logger.info(f"Retry request for job {job_id} not in failed/cancelled state (status: {job.status})")
+            return {"status": job.status, "message": "Job is not failed or cancelled, cannot retry"}
+        # Reset job state
+        job.status = "queued"
+        job.progress = 0
+        job.result = None
+        job.cancelled = 0
+        db.commit()
+        logger.info(f"Job {job_id} retried by user.")
+        # Enqueue background analysis
+        background_tasks.add_task(_run_analysis, job.id)
+        return {"status": "queued", "job_id": job.id}
+    finally:
+        db.close()
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    logger.info(f"Request: {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response: {request.method} {request.url} {response.status_code}")
+    return response
+
+
+# Setup logging (ensure this is before any function that uses logger)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    handlers=[
+        logging.FileHandler("server.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("serverpg")
 
