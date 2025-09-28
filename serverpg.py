@@ -962,6 +962,7 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
 def get_jazler_spots(
     active_only: bool = Query(True, description="Only show active records"),
     print_date: Optional[str] = Query(None, description="Filter by print date"),
+    running_between: Optional[str] = Query(None, description="Filter by running between date range"),
     limit: int = Query(100, ge=1, le=1000, description="Max number of records to return")
 ):
     """
@@ -976,6 +977,9 @@ def get_jazler_spots(
         
         if print_date:
             query = query.filter(JazlerSpot.print_date == print_date)
+            
+        if running_between:
+            query = query.filter(JazlerSpot.running_between == running_between)
         
         query = query.order_by(JazlerSpot.print_date.desc(), JazlerSpot.title)
         spots = query.limit(limit).all()
