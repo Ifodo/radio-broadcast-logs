@@ -891,17 +891,44 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
                 ).first()
                 
                 if existing:
-                    # Update existing record
-                    existing.ad_company = report.ad_company
-                    existing.client = report.client
-                    existing.total_spots = report.total_spots
-                    existing.days = report.days
-                    existing.station_address = report.station_address
-                    existing.print_date = report.print_date
-                    existing.running_between = report.running_between
-                    existing.is_active = 1
-                    results["updated"] += 1
-                    logger.info(f"Updated spot record: {report.title}")
+                    # Compare core fields that should always be updated if different
+                    needs_update = (
+                        existing.ad_company != report.ad_company or
+                        existing.client != report.client or
+                        existing.total_spots != report.total_spots or
+                        existing.days != report.days or
+                        existing.station_address != report.station_address or
+                        existing.is_active != 1
+                    )
+                    
+                    # Check if print_date is more recent
+                    has_newer_date = False
+                    try:
+                        existing_date = datetime.strptime(existing.print_date, "%m/%d/%Y %I:%M:%S %p")
+                        report_date = datetime.strptime(report.print_date, "%m/%d/%Y %I:%M:%S %p")
+                        has_newer_date = report_date > existing_date
+                    except Exception:
+                        # If date parsing fails, don't update dates
+                        logger.warning(f"Date parsing failed for {report.title}")
+                        pass
+                    
+                    if needs_update or has_newer_date:
+                        # Update core fields if needed
+                        if needs_update:
+                            existing.ad_company = report.ad_company
+                            existing.client = report.client
+                            existing.total_spots = report.total_spots
+                            existing.days = report.days
+                            existing.station_address = report.station_address
+                            existing.is_active = 1
+                        
+                        # Update dates only if newer
+                        if has_newer_date:
+                            existing.print_date = report.print_date
+                            existing.running_between = report.running_between
+                        
+                        results["updated"] += 1
+                        logger.info(f"Updated spot record: {report.title} (core_update={needs_update}, date_update={has_newer_date})")
                 else:
                     # Create new record
                     new_spot = JazlerSpot(
@@ -953,6 +980,70 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
     finally:
         db.close()
 
+
+@app.post("/jazler_spots_report/cleanup")
+def cleanup_jazler_spots():
+    """
+    Remove duplicate records keeping only the latest version of each title
+    """
+    db = SessionLocal()
+    try:
+        # First, drop existing unique constraint if it exists
+        try:
+            db.execute(sql_text("ALTER TABLE jazler_spots DROP CONSTRAINT IF EXISTS uq_spot_title"))
+            db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to drop constraint: {e}")
+            db.rollback()
+
+        # Delete all but the latest record for each title using a direct SQL approach
+        cleanup_sql = sql_text("""
+            WITH ranked_records AS (
+                SELECT id,
+                       title,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY title
+                           ORDER BY id DESC
+                       ) as rn
+                FROM jazler_spots
+            )
+            DELETE FROM jazler_spots
+            WHERE id IN (
+                SELECT id
+                FROM ranked_records
+                WHERE rn > 1
+            )
+            RETURNING id;
+        """)
+        
+        result = db.execute(cleanup_sql)
+        deleted_records = result.fetchall()
+        duplicates_removed = len(deleted_records)
+        
+        logger.info(f"Removed {duplicates_removed} duplicate records with IDs: {[r[0] for r in deleted_records]}")
+        
+        # Add unique constraint on title
+        try:
+            db.execute(sql_text("ALTER TABLE jazler_spots ADD CONSTRAINT uq_spot_title UNIQUE (title)"))
+        except Exception as e:
+            logger.warning(f"Failed to add constraint: {e}")
+            db.rollback()
+        
+        # Ensure all remaining records are active
+        db.query(JazlerSpot).update({"is_active": 1}, synchronize_session=False)
+        db.commit()
+        return {
+            "status": "success",
+            "duplicates_removed": duplicates_removed,
+            "message": f"Successfully removed {duplicates_removed} duplicate records"
+        }
+    except Exception as e:
+        db.rollback()
+        error_msg = f"Error cleaning up duplicates: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    finally:
+        db.close()
 
 @app.delete("/jazler_spots_report/all")
 def delete_all_jazler_spots():
