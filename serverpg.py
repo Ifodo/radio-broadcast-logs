@@ -958,6 +958,66 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
         db.close()
 
 
+@app.delete("/jazler_spots_report/all")
+def delete_all_jazler_spots():
+    """
+    Delete all Jazler spot reports from the database
+    """
+    db = SessionLocal()
+    try:
+        # Get count before deletion for reporting
+        total = db.query(JazlerSpot).count()
+        
+        # Delete all records
+        db.query(JazlerSpot).delete()
+        db.commit()
+        
+        return {
+            "status": "success",
+            "deleted_count": total,
+            "message": f"Successfully deleted {total} spot reports"
+        }
+    except Exception as e:
+        db.rollback()
+        error_msg = f"Error deleting all spots: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    finally:
+        db.close()
+
+@app.delete("/jazler_spots_report/by-client/{client}")
+def delete_jazler_spots_by_client(client: str):
+    """
+    Delete all Jazler spot reports for a specific client (case-insensitive)
+    """
+    db = SessionLocal()
+    try:
+        # Get matching records count before deletion
+        matching_spots = db.query(JazlerSpot).filter(JazlerSpot.client.ilike(f"%{client}%"))
+        total = matching_spots.count()
+        
+        if total == 0:
+            raise HTTPException(status_code=404, detail=f"No spots found for client: {client}")
+        
+        # Delete matching records
+        matching_spots.delete(synchronize_session=False)
+        db.commit()
+        
+        return {
+            "status": "success",
+            "deleted_count": total,
+            "message": f"Successfully deleted {total} spot reports for client: {client}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        error_msg = f"Error deleting spots for client {client}: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    finally:
+        db.close()
+
 @app.get("/jazler_spots_report")
 def get_jazler_spots(
     active_only: bool = Query(True, description="Only show active records"),
