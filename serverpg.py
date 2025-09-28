@@ -586,7 +586,7 @@ from sqlalchemy import JSON  # add JSON type for analysis result storage
 class JazlerSpot(Base):
     __tablename__ = "jazler_spots"
     id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(255), nullable=False, index=True)
+    title = Column(String(255), nullable=False, unique=True)  # Make title directly unique
     ad_company = Column(String(255))
     client = Column(String(255))
     total_spots = Column(Integer, default=0)
@@ -597,9 +597,6 @@ class JazlerSpot(Base):
     first_seen = Column(DateTime, default=datetime.utcnow)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active = Column(Integer, default=1)
-    __table_args__ = (
-        UniqueConstraint('title', name='uq_spot_title'),
-    )
 
 class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"
@@ -888,10 +885,9 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
         
         for report in reports:
             try:
-                # Check if an active record exists with this title
+                # Try to get any existing record with this title
                 existing = db.query(JazlerSpot).filter(
-                    JazlerSpot.title == report.title,
-                    JazlerSpot.is_active == 1
+                    JazlerSpot.title == report.title
                 ).first()
                 
                 if existing:
@@ -907,40 +903,21 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
                     results["updated"] += 1
                     logger.info(f"Updated spot record: {report.title}")
                 else:
-                    # Check if there's an inactive record with this title
-                    inactive = db.query(JazlerSpot).filter(
-                        JazlerSpot.title == report.title,
-                        JazlerSpot.is_active == 0
-                    ).first()
-                    
-                    if inactive:
-                        # Reactivate and update the inactive record
-                        inactive.ad_company = report.ad_company
-                        inactive.client = report.client
-                        inactive.total_spots = report.total_spots
-                        inactive.days = report.days
-                        inactive.station_address = report.station_address
-                        inactive.print_date = report.print_date
-                        inactive.running_between = report.running_between
-                        inactive.is_active = 1
-                        results["updated"] += 1
-                        logger.info(f"Reactivated spot record: {report.title}")
-                    else:
-                        # Create new record
-                        new_spot = JazlerSpot(
-                            title=report.title,
-                            ad_company=report.ad_company,
-                            client=report.client,
-                            total_spots=report.total_spots,
-                            days=report.days,
-                            station_address=report.station_address,
-                            print_date=report.print_date,
-                            running_between=report.running_between,
-                            is_active=1
-                        )
-                        db.add(new_spot)
-                        results["inserted"] += 1
-                        logger.info(f"Inserted new spot record: {report.title}")
+                    # Create new record
+                    new_spot = JazlerSpot(
+                        title=report.title,
+                        ad_company=report.ad_company,
+                        client=report.client,
+                        total_spots=report.total_spots,
+                        days=report.days,
+                        station_address=report.station_address,
+                        print_date=report.print_date,
+                        running_between=report.running_between,
+                        is_active=1
+                    )
+                    db.add(new_spot)
+                    results["inserted"] += 1
+                    logger.info(f"Inserted new spot record: {report.title}")
                 
             except Exception as e:
                 error_msg = f"Error processing report for {report.title}: {str(e)}"
@@ -951,9 +928,14 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
         # Mark all records not in this batch as inactive
         if reports:
             active_titles = tuple(r.title for r in reports)
+            # Only deactivate records that aren't in the current batch
             db.query(JazlerSpot).filter(
                 JazlerSpot.title.notin_(active_titles)
             ).update({"is_active": 0}, synchronize_session=False)
+            # Ensure all records in the current batch are active
+            db.query(JazlerSpot).filter(
+                JazlerSpot.title.in_(active_titles)
+            ).update({"is_active": 1}, synchronize_session=False)
         
         db.commit()
         return {
