@@ -996,31 +996,72 @@ def cleanup_jazler_spots():
             logger.warning(f"Failed to drop constraint: {e}")
             db.rollback()
 
-        # Delete all but the latest record for each title using a direct SQL approach
+        # Create a temporary table with the records we want to keep
         cleanup_sql = sql_text("""
+            -- First create temp table with records to keep
+            CREATE TEMP TABLE spots_to_keep AS
             WITH ranked_records AS (
-                SELECT id,
-                       title,
+                SELECT *,
                        ROW_NUMBER() OVER (
                            PARTITION BY title
                            ORDER BY id DESC
                        ) as rn
                 FROM jazler_spots
             )
-            DELETE FROM jazler_spots
-            WHERE id IN (
-                SELECT id
-                FROM ranked_records
-                WHERE rn > 1
+            SELECT id as old_id,
+                   ROW_NUMBER() OVER (ORDER BY title) as new_id,
+                   title,
+                   ad_company,
+                   client,
+                   total_spots,
+                   days,
+                   station_address,
+                   print_date,
+                   running_between,
+                   first_seen,
+                   last_updated,
+                   is_active
+            FROM ranked_records
+            WHERE rn = 1
+            ORDER BY title;
+
+            -- Delete all existing records
+            DELETE FROM jazler_spots;
+
+            -- Insert records back with new IDs
+            INSERT INTO jazler_spots (
+                id, title, ad_company, client, total_spots, days,
+                station_address, print_date, running_between,
+                first_seen, last_updated, is_active
             )
-            RETURNING id;
+            SELECT 
+                new_id, title, ad_company, client, total_spots, days,
+                station_address, print_date, running_between,
+                first_seen, last_updated, is_active
+            FROM spots_to_keep
+            ORDER BY new_id;
+
+            -- Get count of affected records
+            SELECT COUNT(*) as count FROM spots_to_keep;
         """)
         
-        result = db.execute(cleanup_sql)
-        deleted_records = result.fetchall()
-        duplicates_removed = len(deleted_records)
+        # Execute all statements and get final count
+        results = db.execute(cleanup_sql)
+        while results.nextset():  # Skip to last result
+            pass
+        count = results.fetchone()[0]
         
-        logger.info(f"Removed {duplicates_removed} duplicate records with IDs: {[r[0] for r in deleted_records]}")
+        logger.info(f"Resequenced {count} records with IDs 1 to {count}")
+        
+        # Drop temporary table
+        db.execute("DROP TABLE IF EXISTS spots_to_keep")
+        
+        # Reset the sequence
+        db.execute(sql_text("""
+            SELECT setval(pg_get_serial_sequence('jazler_spots', 'id'), 
+                         (SELECT COALESCE(MAX(id), 0) FROM jazler_spots), 
+                         false)
+        """))
         
         # Add unique constraint on title
         try:
@@ -1034,8 +1075,8 @@ def cleanup_jazler_spots():
         db.commit()
         return {
             "status": "success",
-            "duplicates_removed": duplicates_removed,
-            "message": f"Successfully removed {duplicates_removed} duplicate records"
+            "records_resequenced": count,
+            "message": f"Successfully resequenced {count} records with IDs 1 to {count}"
         }
     except Exception as e:
         db.rollback()
