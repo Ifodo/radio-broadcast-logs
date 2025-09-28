@@ -1227,6 +1227,101 @@ def get_jazler_spots(
         db.close()
 
 
+@app.get("/compliance")
+def get_compliance_report(
+    start_date: Optional[str] = Query(None, description="Start date for compliance period (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date for compliance period (YYYY-MM-DD)"),
+    client: Optional[str] = Query(None, description="Filter by client name (case-insensitive)")
+):
+    """
+    Get compliance report comparing planned vs aired spots
+    """
+    db = SessionLocal()
+    try:
+        # Get planned spots
+        planned_query = db.query(JazlerSpot)
+        if client:
+            planned_query = planned_query.filter(JazlerSpot.client.ilike(f"%{client}%"))
+        planned_spots = planned_query.filter(JazlerSpot.is_active == 1).all()
+
+        # Get aired spots from stats
+        aired_spots_sql = sql_text("""
+            WITH base AS (
+                SELECT
+                    lower(trim(title)) AS group_title,
+                    COALESCE(air_timestamp, timestamp) AS ts
+                FROM logs
+                WHERE event_type ILIKE 'SPOT'
+                  AND title IS NOT NULL
+                  AND (:start_date IS NULL OR CAST(COALESCE(air_timestamp, timestamp) AS DATE) >= :start_date::DATE)
+                  AND (:end_date IS NULL OR CAST(COALESCE(air_timestamp, timestamp) AS DATE) <= :end_date::DATE)
+            )
+            SELECT 
+                group_title AS title,
+                COUNT(*) AS total_count,
+                MIN(ts) AS first_air_timestamp,
+                MAX(ts) AS last_air_timestamp
+            FROM base
+            GROUP BY group_title
+            ORDER BY COUNT(*) DESC
+        """)
+        
+        aired_results = db.execute(aired_spots_sql, {
+            "start_date": start_date,
+            "end_date": end_date
+        }).fetchall()
+
+        # Build compliance report
+        compliance_data = []
+        for planned in planned_spots:
+            # Find matching aired data
+            aired = next(
+                (row for row in aired_results if row[0].lower() == planned.title.lower()),
+                None
+            )
+            
+            aired_count = int(aired[1]) if aired else 0
+            compliance_pct = (aired_count / planned.total_spots * 100) if planned.total_spots > 0 else 0
+            
+            compliance_data.append({
+                "title": planned.title,
+                "client": planned.client,
+                "planned_spots": planned.total_spots,
+                "aired_spots": aired_count,
+                "compliance_percentage": round(compliance_pct, 2),
+                "print_date": planned.print_date,
+                "running_between": planned.running_between,
+                "first_aired": aired[2].isoformat() if aired and aired[2] else None,
+                "last_aired": aired[3].isoformat() if aired and aired[3] else None,
+                "status": "Completed" if aired_count >= planned.total_spots else "In Progress" if aired_count > 0 else "Not Started"
+            })
+
+        # Calculate overall compliance
+        total_planned = sum(item["planned_spots"] for item in compliance_data)
+        total_aired = sum(item["aired_spots"] for item in compliance_data)
+        overall_compliance = (total_aired / total_planned * 100) if total_planned > 0 else 0
+
+        return {
+            "status": "success",
+            "period": {
+                "start_date": start_date,
+                "end_date": end_date
+            },
+            "overall_stats": {
+                "total_planned_spots": total_planned,
+                "total_aired_spots": total_aired,
+                "overall_compliance_percentage": round(overall_compliance, 2)
+            },
+            "spots": sorted(compliance_data, key=lambda x: x["compliance_percentage"], reverse=True)
+        }
+        
+    except Exception as e:
+        error_msg = f"Error generating compliance report: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    finally:
+        db.close()
+
 @app.middleware("http")
 async def log_requests(request, call_next):
     logger.info(f"Request: {request.method} {request.url}")
