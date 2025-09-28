@@ -1075,7 +1075,7 @@ def cleanup_jazler_spots():
         logger.info(f"Resequenced {count} records with IDs 1 to {count}")
         
         # Drop temporary table
-        db.execute("DROP TABLE IF EXISTS spots_to_keep")
+        db.execute(sql_text("DROP TABLE IF EXISTS spots_to_keep"))
         
         # Reset the sequence
         db.execute(sql_text("""
@@ -1196,7 +1196,7 @@ def get_jazler_spots(
         
         query = query.order_by(JazlerSpot.print_date.desc(), JazlerSpot.title)
         spots = query.limit(limit).all()
-        
+
         return {
             "status": "success",
             "count": len(spots),
