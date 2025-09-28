@@ -1045,57 +1045,32 @@ def cleanup_jazler_spots():
             SELECT COUNT(*) as count FROM spots_to_keep;
         """)
         
-        # Execute cleanup in separate statements
-        # First create temp table and get records to keep
-        db.execute(sql_text("""
-            CREATE TEMP TABLE spots_to_keep AS
-            WITH ranked_records AS (
-                SELECT *,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY title
-                           ORDER BY id DESC
-                       ) as rn
-                FROM jazler_spots
-            )
-            SELECT id as old_id,
-                   ROW_NUMBER() OVER (ORDER BY title) as new_id,
-                   title,
-                   ad_company,
-                   client,
-                   total_spots,
-                   days,
-                   station_address,
-                   print_date,
-                   running_between,
-                   first_seen,
-                   last_updated,
-                   is_active
-            FROM ranked_records
-            WHERE rn = 1
-            ORDER BY title;
-        """))
-
-        # Get count of records
-        result = db.execute("SELECT COUNT(*) FROM spots_to_keep")
-        count = result.scalar()
-
-        # Delete all existing records
-        db.execute("DELETE FROM jazler_spots")
-
-        # Insert records back with new IDs
-        db.execute(sql_text("""
-            INSERT INTO jazler_spots (
-                id, title, ad_company, client, total_spots, days,
-                station_address, print_date, running_between,
-                first_seen, last_updated, is_active
-            )
-            SELECT 
-                new_id, title, ad_company, client, total_spots, days,
-                station_address, print_date, running_between,
-                first_seen, last_updated, is_active
-            FROM spots_to_keep
-            ORDER BY new_id;
-        """))
+        # Get all records ordered by title
+        records = db.query(JazlerSpot).order_by(JazlerSpot.title).all()
+        
+        # Keep track of which titles we've seen
+        seen_titles = set()
+        records_to_keep = []
+        records_to_delete = []
+        
+        # Find duplicates and records to keep
+        for record in records:
+            if record.title not in seen_titles:
+                seen_titles.add(record.title)
+                records_to_keep.append(record)
+            else:
+                records_to_delete.append(record)
+        
+        # Delete duplicate records
+        for record in records_to_delete:
+            db.delete(record)
+        
+        # Update IDs on remaining records
+        for i, record in enumerate(records_to_keep, 1):
+            record.id = i
+            record.is_active = 1
+        
+        count = len(records_to_keep)
         
         logger.info(f"Resequenced {count} records with IDs 1 to {count}")
         
