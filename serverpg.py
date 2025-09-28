@@ -586,7 +586,7 @@ from sqlalchemy import JSON  # add JSON type for analysis result storage
 class JazlerSpot(Base):
     __tablename__ = "jazler_spots"
     id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(255), nullable=False)
+    title = Column(String(255), nullable=False, index=True)
     ad_company = Column(String(255))
     client = Column(String(255))
     total_spots = Column(Integer, default=0)
@@ -597,7 +597,9 @@ class JazlerSpot(Base):
     first_seen = Column(DateTime, default=datetime.utcnow)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active = Column(Integer, default=1)
-    __table_args__ = (UniqueConstraint('title', 'print_date', name='uq_spot_title_date'),)
+    __table_args__ = (
+        UniqueConstraint('title', name='uq_spot_title'),
+    )
 
 class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"
@@ -886,10 +888,10 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
         
         for report in reports:
             try:
-                # Check if record exists
+                # Check if an active record exists with this title
                 existing = db.query(JazlerSpot).filter(
                     JazlerSpot.title == report.title,
-                    JazlerSpot.print_date == report.print_date
+                    JazlerSpot.is_active == 1
                 ).first()
                 
                 if existing:
@@ -899,26 +901,46 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
                     existing.total_spots = report.total_spots
                     existing.days = report.days
                     existing.station_address = report.station_address
+                    existing.print_date = report.print_date
                     existing.running_between = report.running_between
                     existing.is_active = 1
                     results["updated"] += 1
                     logger.info(f"Updated spot record: {report.title}")
                 else:
-                    # Create new record
-                    new_spot = JazlerSpot(
-                        title=report.title,
-                        ad_company=report.ad_company,
-                        client=report.client,
-                        total_spots=report.total_spots,
-                        days=report.days,
-                        station_address=report.station_address,
-                        print_date=report.print_date,
-                        running_between=report.running_between,
-                        is_active=1
-                    )
-                    db.add(new_spot)
-                    results["inserted"] += 1
-                    logger.info(f"Inserted new spot record: {report.title}")
+                    # Check if there's an inactive record with this title
+                    inactive = db.query(JazlerSpot).filter(
+                        JazlerSpot.title == report.title,
+                        JazlerSpot.is_active == 0
+                    ).first()
+                    
+                    if inactive:
+                        # Reactivate and update the inactive record
+                        inactive.ad_company = report.ad_company
+                        inactive.client = report.client
+                        inactive.total_spots = report.total_spots
+                        inactive.days = report.days
+                        inactive.station_address = report.station_address
+                        inactive.print_date = report.print_date
+                        inactive.running_between = report.running_between
+                        inactive.is_active = 1
+                        results["updated"] += 1
+                        logger.info(f"Reactivated spot record: {report.title}")
+                    else:
+                        # Create new record
+                        new_spot = JazlerSpot(
+                            title=report.title,
+                            ad_company=report.ad_company,
+                            client=report.client,
+                            total_spots=report.total_spots,
+                            days=report.days,
+                            station_address=report.station_address,
+                            print_date=report.print_date,
+                            running_between=report.running_between,
+                            is_active=1
+                        )
+                        db.add(new_spot)
+                        results["inserted"] += 1
+                        logger.info(f"Inserted new spot record: {report.title}")
                 
             except Exception as e:
                 error_msg = f"Error processing report for {report.title}: {str(e)}"
