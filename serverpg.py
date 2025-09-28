@@ -963,6 +963,7 @@ def get_jazler_spots(
     active_only: bool = Query(True, description="Only show active records"),
     print_date: Optional[str] = Query(None, description="Filter by print date"),
     running_between: Optional[str] = Query(None, description="Filter by running between date range"),
+    client: Optional[str] = Query(None, description="Filter by client name (case-insensitive)"),
     limit: int = Query(100, ge=1, le=1000, description="Max number of records to return")
 ):
     """
@@ -980,6 +981,9 @@ def get_jazler_spots(
             
         if running_between:
             query = query.filter(JazlerSpot.running_between == running_between)
+            
+        if client:
+            query = query.filter(JazlerSpot.client.ilike(f"%{client}%"))
         
         query = query.order_by(JazlerSpot.print_date.desc(), JazlerSpot.title)
         spots = query.limit(limit).all()
