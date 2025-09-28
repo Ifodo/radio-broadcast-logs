@@ -948,20 +948,12 @@ def receive_jazler_spots(reports: List[JazlerSpotReport]):
                 logger.error(error_msg)
                 continue
         
-        # Mark all non-updated records as inactive
-        update_query = """
-            UPDATE jazler_spots 
-            SET is_active = 0 
-            WHERE print_date = :print_date 
-            AND title NOT IN :active_titles
-        """
+        # Mark all records not in this batch as inactive
         if reports:
             active_titles = tuple(r.title for r in reports)
-            print_date = reports[0].print_date
-            db.execute(sql_text(update_query), {
-                "print_date": print_date,
-                "active_titles": active_titles if active_titles else ('',)
-            })
+            db.query(JazlerSpot).filter(
+                JazlerSpot.title.notin_(active_titles)
+            ).update({"is_active": 0}, synchronize_session=False)
         
         db.commit()
         return {
