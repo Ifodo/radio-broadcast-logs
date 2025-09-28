@@ -583,6 +583,22 @@ def stats_spots_all(
 from sqlalchemy import JSON  # add JSON type for analysis result storage
 
 # ---------- New Model for Analysis Jobs ----------
+class JazlerSpot(Base):
+    __tablename__ = "jazler_spots"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    ad_company = Column(String(255))
+    client = Column(String(255))
+    total_spots = Column(Integer, default=0)
+    days = Column(Integer, default=0)
+    station_address = Column(String(255))
+    print_date = Column(String(50))
+    running_between = Column(String(50))
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = Column(Integer, default=1)
+    __table_args__ = (UniqueConstraint('title', 'print_date', name='uq_spot_title_date'),)
+
 class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"
     id = Column(Integer, primary_key=True, index=True)
@@ -754,6 +770,19 @@ def get_analysis_report(job_id: int):
         db.close()
 
 
+class JazlerSpotReport(BaseModel):
+    title: str
+    ad_company: str
+    client: str
+    total_spots: int
+    days: int
+    station_address: str
+    print_date: str
+    running_between: str
+    first_seen: Optional[str] = None
+    last_updated: Optional[str] = None
+    is_active: bool = True
+
 class SendReportRequest(BaseModel):
     email: str
 
@@ -837,6 +866,146 @@ def retry_analysis_job(job_id: int, background_tasks: BackgroundTasks):
         # Enqueue background analysis
         background_tasks.add_task(_run_analysis, job.id)
         return {"status": "queued", "job_id": job.id}
+    finally:
+        db.close()
+
+
+@app.post("/jazler_spots_report")
+def receive_jazler_spots(reports: List[JazlerSpotReport]):
+    """
+    Receive and store Jazler spot reports from monitor.py
+    Each report contains spot information including title, client, spots count, etc.
+    """
+    db = SessionLocal()
+    try:
+        results = {
+            "inserted": 0,
+            "updated": 0,
+            "errors": []
+        }
+        
+        for report in reports:
+            try:
+                # Check if record exists
+                existing = db.query(JazlerSpot).filter(
+                    JazlerSpot.title == report.title,
+                    JazlerSpot.print_date == report.print_date
+                ).first()
+                
+                if existing:
+                    # Update existing record
+                    existing.ad_company = report.ad_company
+                    existing.client = report.client
+                    existing.total_spots = report.total_spots
+                    existing.days = report.days
+                    existing.station_address = report.station_address
+                    existing.running_between = report.running_between
+                    existing.is_active = 1
+                    results["updated"] += 1
+                    logger.info(f"Updated spot record: {report.title}")
+                else:
+                    # Create new record
+                    new_spot = JazlerSpot(
+                        title=report.title,
+                        ad_company=report.ad_company,
+                        client=report.client,
+                        total_spots=report.total_spots,
+                        days=report.days,
+                        station_address=report.station_address,
+                        print_date=report.print_date,
+                        running_between=report.running_between,
+                        is_active=1
+                    )
+                    db.add(new_spot)
+                    results["inserted"] += 1
+                    logger.info(f"Inserted new spot record: {report.title}")
+                
+            except Exception as e:
+                error_msg = f"Error processing report for {report.title}: {str(e)}"
+                results["errors"].append(error_msg)
+                logger.error(error_msg)
+                continue
+        
+        # Mark all non-updated records as inactive
+        update_query = """
+            UPDATE jazler_spots 
+            SET is_active = 0 
+            WHERE print_date = :print_date 
+            AND title NOT IN :active_titles
+        """
+        if reports:
+            active_titles = tuple(r.title for r in reports)
+            print_date = reports[0].print_date
+            db.execute(sql_text(update_query), {
+                "print_date": print_date,
+                "active_titles": active_titles if active_titles else ('',)
+            })
+        
+        db.commit()
+        return {
+            "status": "success",
+            "inserted": results["inserted"],
+            "updated": results["updated"],
+            "errors": results["errors"]
+        }
+        
+    except Exception as e:
+        db.rollback()
+        error_msg = f"Error processing reports batch: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    finally:
+        db.close()
+
+
+@app.get("/jazler_spots_report")
+def get_jazler_spots(
+    active_only: bool = Query(True, description="Only show active records"),
+    print_date: Optional[str] = Query(None, description="Filter by print date"),
+    limit: int = Query(100, ge=1, le=1000, description="Max number of records to return")
+):
+    """
+    Retrieve Jazler spot reports with optional filtering
+    """
+    db = SessionLocal()
+    try:
+        query = db.query(JazlerSpot)
+        
+        if active_only:
+            query = query.filter(JazlerSpot.is_active == 1)
+        
+        if print_date:
+            query = query.filter(JazlerSpot.print_date == print_date)
+        
+        query = query.order_by(JazlerSpot.print_date.desc(), JazlerSpot.title)
+        spots = query.limit(limit).all()
+        
+        return {
+            "status": "success",
+            "count": len(spots),
+            "records": [
+                {
+                    "id": spot.id,
+                    "title": spot.title,
+                    "ad_company": spot.ad_company,
+                    "client": spot.client,
+                    "total_spots": spot.total_spots,
+                    "days": spot.days,
+                    "station_address": spot.station_address,
+                    "print_date": spot.print_date,
+                    "running_between": spot.running_between,
+                    "first_seen": spot.first_seen.isoformat() if spot.first_seen else None,
+                    "last_updated": spot.last_updated.isoformat() if spot.last_updated else None,
+                    "is_active": bool(spot.is_active)
+                }
+                for spot in spots
+            ]
+        }
+        
+    except Exception as e:
+        error_msg = f"Error retrieving spots: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
     finally:
         db.close()
 
